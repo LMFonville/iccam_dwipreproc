@@ -39,13 +39,15 @@ from os.path import join as opj
 
 from nipype.pipeline.engine import Workflow, Node
 from nipype.interfaces.utility import Function
-from nipype.interfaces.io import DataGrabber, DataSink
+from nipype.interfaces.io import DataGrabber, DataSink, FreeSurferSource
 from nipype.interfaces.fsl import ImageStats, ImageMaths
 from nipype.interfaces.ants import N4BiasFieldCorrection, Registration, ApplyTransforms
+from nipype.interfaces.freesurfer import FSCommand, Binarize
 
 # Paths and parameters
-preproc_dir = '/rds/general/project/adobe_addiction_and_obesity_cohort/live/output/re_dwipreproc/'
+preproc_dir = '/rds/general/project/adobe_addiction_and_obesity_cohort/live/output/dwipreproc/'
 scratch_dir = opj('/rds/general/project/adobe_addiction_and_obesity_cohort/ephemeral', subject_id)
+freesurfer_dir = '/rds/general/project/adobe_addiction_and_obesity_cohort/live/output/freesurfer/'
 
 #custom functions
 def mask_img(in_file):
@@ -101,6 +103,12 @@ def extract_warp(warp):# fix the warp file to grab the flow field in the y plane
     nb.save(warp_img, warpOut)
     return warpOut
 
+def get_aparc_aseg(files):
+    for name in files:
+        if 'aparc+aseg' in name:
+            return name
+    raise ValueError('aparc+aseg not found')
+
 # Specify nodes
 # Get input nifti files for dwi and t1
 getdata = Node(DataGrabber(outfields=['dwi','bvec','bval','anat', 'mask', 'wm'], sort_filelist=True), name = 'getdata')
@@ -113,6 +121,11 @@ getdata.inputs.field_template = dict(dwi='%s/preproc2_eddy/*_eddy.nii.gz',
                                      mask='%s/preproc0_segment/*_BrainMask.nii.gz',
                                      wm = '%s/preproc0_segment/*_WM.nii.gz')
 getdata.inputs.template_args = dict(dwi=[[subject_id]], bvec=[[subject_id]], bval=[[subject_id]], anat=[[subject_id]], mask=[[subject_id]], wm=[[subject_id]])
+
+# Data grabber specific for FreeSurfer data
+fssource = Node(FreeSurferSource(subjects_dir=freesurfer_dir, hemi = 'both', subject_id=subject_id),
+                run_without_submitting=True,
+                name='fssource')
 
 # Get B0 again after eddy and create mask
 maskdwi = Node(Function(input_names=['in_file'],
@@ -144,7 +157,7 @@ getformula = Node(Function(input_files=['statFS', 'ratio'],
 # Apply the formula to the T1 image
 invertT1 = Node(ImageMaths(out_file=subject_id + '_invertT1.nii.gz'), name = 'invertT1')
 
-# Register inverted T1 to extracted B0 and apply inverted warp to T1
+# Register extracted B0 to inverted T1 and apply inverse warp to T1
 reg_rigid = Node(Registration(), name = 'reg_rigid')
 reg_rigid.inputs.num_threads=16
 reg_rigid.inputs.dimension=3
@@ -173,7 +186,12 @@ reg_rigid.inputs.output_inverse_warped_image = subject_id + 'invT1_to_DWI.nii.gz
 # Warp the WM to DWI space as well
 warpWMrigid = Node(ApplyTransforms(invert_transform_flags=True), name = 'warpWMrigid')
 warpWMrigid.inputs.output_image = subject_id + '_WM_to_DWI.nii.gz'
-warpWMrigid.interpolation = 'NearestNeighbor'
+warpWMrigid.inputs.interpolation = 'NearestNeighbor'
+
+# Warp aparc+aseg.mgz as well
+warpFS = Node(ApplyTransforms(invert_transform_flags=True), name = 'warpFS')
+warpFS.inputs.output_image = subject_id + '_aparc+aseg_to_DWI.nii.gz'
+warpFS.inputs.interpolation = 'NearestNeighbor'
 
 # Get the non-linear deformation along the phase-encoding direction
 synreg = Node(Registration(), name = 'synreg')
@@ -259,6 +277,10 @@ preproc3_wf.connect([
     (getdata, warpWMrigid, [('wm', 'input_image')]),
     (reg_rigid, warpWMrigid, [('reverse_transforms', 'transforms')]),
     (biasB0, warpWMrigid, [('output_image', 'reference_image')]),
+    # also apply to freesurfer parcellations
+    (fssource, warpFS, [(('aparc_aseg', get_aparc_aseg), 'input_image')]),
+    (reg_rigid, warpFS, [('reverse_transforms', 'transforms')]),
+    (biasB0, warpFS, [('output_image', 'reference_image')]),
     # non-linear registration of B0 to rigidly aligned inverted T1
     (biasB0, synreg, [('output_image', 'moving_image')]),
     (reg_rigid, synreg, [('inverse_warped_image', 'fixed_image')]),
@@ -284,11 +306,13 @@ preproc3_wf.connect([
     (invertT1, datasink, [('out_file', 'preproc3_distortion.native.@invT1')]),
     (dwi_edge, datasink, [('out_file', 'preproc3_distortion.native.@dwi_edge')]),
     (reg_rigid, datasink, [('inverse_warped_image', 'preproc3_distortion.@invT1')]),
+    (reg_rigid, datasink, [('forward_transforms', 'preproc3_distortion.@t1warp')]),
     (synreg, datasink, [('warped_image', 'preproc3_distortion.@normB0')]),
     (synreg, datasink, [('inverse_warped_image', 'preproc3_distortion.@synT1')]),
     (synwarp, datasink, [('output_image', 'preproc3_distortion.@normdwi')]),
     (grabwarp, datasink, [('yWarp', 'preproc3_distortion.@warp')]),
     (warpWMrigid, datasink, [('output_image', 'preproc3_distortion.@WM')]),
+    (warpFS, datasink, [('output_image', 'preproc3_distortion.@aparc')]),
     (wm_edge, datasink, [('out_file', 'preproc3_distortion.@WMedge')]),
     (t1_edge, datasink, [('out_file', 'preproc3_distortion.@t1_edge')]),
     (dwi_edge_syn, datasink, [('out_file', 'preproc3_distortion.@dwi_edge_syn')]),
